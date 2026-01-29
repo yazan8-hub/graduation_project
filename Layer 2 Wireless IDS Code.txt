@@ -1,0 +1,286 @@
+/*
+ * ======================================================================================
+ * PROJECT NAME:   ESP32 Lightweight SOHO-IDS Firmware 
+ * AUTHORS:        [YAZAN TAHA] 
+ * TARGET:         ESP32 WROOM-32
+ * DESCRIPTION:    Real-time Layer 2 Wireless Intrusion Detection System.
+ * Detects Deauth, Beacon Floods, Probe Requests, and ARP/Broadcast Floods
+ * using Promiscuous Mode and alerts via Telegram API.
+ * ======================================================================================
+ */
+#include <WiFi.h>
+#include "esp_wifi.h"
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+
+// ============================
+// ⚠️ WiFi & Telegram Settings
+// ============================
+// NOTE: Sensitive credentials have been redacted for security purposes.
+const char* ssid = "YOUR_WIFI_SSID";          // Replace with Target Network Name
+const char* password = "YOUR_WIFI_PASSWORD";  // Replace with Target Network Password
+
+
+// Telegram API Configuration
+// Token format: 123456789:AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQq
+char TelegramBOTtoken[60] = "XXXXXXXXX:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"; 
+char Chat_ID[20] = "XXXXXXXXX"; // User ID
+
+
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(TelegramBOTtoken, secured_client);
+
+// ============================
+// Sniffer Settings
+// ============================
+#define CHANNEL 11 
+#define REPORT_INTERVAL 3000
+
+// ============================
+// Counters
+// ============================
+volatile unsigned long mgmtCount = 0;
+volatile unsigned long beaconCount = 0;
+volatile unsigned long probeReqCount = 0;
+volatile unsigned long authCount = 0;
+volatile unsigned long deauthCount = 0;
+volatile unsigned long dataCount = 0;
+volatile unsigned long eapolCount = 0;
+volatile unsigned long broadcastCount = 0; 
+
+// ============================
+// Alert Control
+// ============================
+unsigned long lastAlertTime = 0;
+#define ALERT_COOLDOWN 15000
+
+// ============================
+// Promiscuous Callback
+// ============================
+void promiscuous_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
+  const wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+  const uint8_t* payload = pkt->payload;
+  int len = pkt->rx_ctrl.sig_len;
+
+  if (len < 24) return;
+
+  uint8_t frame_type    = payload[0] & 0x0C;
+  uint8_t frame_subtype = payload[0] & 0xF0;
+
+  switch (frame_type) {
+    case 0x00: // Management
+      mgmtCount++;
+      if (frame_subtype == 0x80) beaconCount++;
+      if (frame_subtype == 0x40) probeReqCount++; 
+      if (frame_subtype == 0xB0) authCount++;
+      if (frame_subtype == 0xC0) deauthCount++;
+      break;
+
+    case 0x08: // Data
+      dataCount++;
+      
+      
+      // In 802.11 Data frames, Address 1 (Receiver Address) is usually at offset 4
+      {
+        bool isBroadcast = true;
+        for (int i = 4; i < 10; i++) { 
+          if (payload[i] != 0xFF) {
+            isBroadcast = false;
+            break;
+          }
+        }
+        if (isBroadcast) {
+           broadcastCount++;
+        }
+      }
+
+      // Check for EAPOL (Handshakes)
+      for (int i = 30; i < 36; i++) {
+        if (payload[i] == 0x88 && payload[i + 1] == 0x8E) {
+          eapolCount++;
+          break;
+        }
+      }
+      break;
+  }
+}
+
+// ============================
+// Telegram Alert Function
+// ============================
+void sendTelegramAlert(String message) {
+  Serial.println("\n>>> 🛑 Attack Detected! Initiating Alert Sequence...");
+
+  // 1. Stop Sniffing
+  esp_wifi_set_promiscuous(false);
+
+  // 2. Reboot Radio 
+  Serial.println("Rebooting WiFi Radio...");
+  WiFi.disconnect(true); 
+  WiFi.mode(WIFI_OFF);
+  delay(1000); 
+
+  // 3. Reconnect Logic
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  unsigned long startAttemptTime = millis();
+  const unsigned long wifiTimeout = 180000; // 3 Minutes
+  
+  if (message.indexOf("Deauth") != -1) {
+      Serial.print("Connecting to WiFi (Waiting for attack to stop)");
+  } else {
+      Serial.print("Connecting to WiFi...");
+  }
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < wifiTimeout) {
+    delay(500);
+    Serial.print(".");
+    
+    if ((millis() - startAttemptTime) % 10000 == 0) {
+        Serial.print(" [Re-Sending Connect Request] ");
+        WiFi.disconnect(); 
+        WiFi.begin(ssid, password);
+    }
+  }
+  Serial.println();
+
+  // 4. Send Message
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✅ WiFi Connected! Sending Telegram now...");
+    secured_client.setInsecure();
+    
+    bool sent = false;
+    for(int i=0; i<5; i++) {
+        if (bot.sendMessage(Chat_ID, message, "Markdown")) {
+            Serial.println("📩 Message Sent Successfully!");
+            sent = true;
+            break;
+        } else {
+            Serial.print("⚠️ Send failed, retrying...");
+            delay(2000);
+        }
+    }
+  } else {
+    Serial.println("❌ Failed to connect.");
+  }
+
+  // 5. Return to Sniffing
+  Serial.println("Returning to Sniffer Mode...");
+  
+  WiFi.disconnect(); 
+  WiFi.mode(WIFI_STA); 
+  delay(100);
+  
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_filter(NULL); 
+  
+  wifi_promiscuous_filter_t filter = {
+    .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
+  };
+  esp_wifi_set_promiscuous_filter(&filter);
+  
+  esp_wifi_set_promiscuous_rx_cb(promiscuous_cb);
+  esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+  
+  Serial.println("🛡️ Returned to Monitoring Mode");
+}
+
+// ============================
+// Setup 
+// ============================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Initial Connection Test
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Initial Connection Test");
+  
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+  }
+  Serial.println();
+
+  if(WiFi.status() == WL_CONNECTED){
+      secured_client.setInsecure();
+      bot.sendMessage(Chat_ID, "🛡️ WiFi IDS System Online", "");
+      Serial.println("System Online - Message Sent");
+  } else {
+      Serial.println("Could not connect initially, starting sniffer anyway...");
+  }
+
+  WiFi.disconnect();
+
+  // Setup Sniffer
+  esp_wifi_set_promiscuous(true);
+  wifi_promiscuous_filter_t filter = {
+    .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
+  };
+  esp_wifi_set_promiscuous_filter(&filter);
+  esp_wifi_set_promiscuous_rx_cb(promiscuous_cb);
+  esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  Serial.println("🛡️ IDS Monitoring Started on Channel " + String(CHANNEL));
+}
+
+// ============================
+// Loop
+// ============================
+void loop() {
+  // ================================================================
+  //  SIMULATION / DEMO MODE (Manual Trigger)
+  // ================================================================
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    String manualAlert = "";
+    unsigned long now = millis();
+
+    if (now - lastAlertTime > ALERT_COOLDOWN) {
+      switch (cmd) {
+        case '1': manualAlert = "🚨 *Deauth Attack Detected*"; break;
+        case '2': manualAlert = "🚨 *Beacon Flood Detected*"; break;
+        case '3': manualAlert = "🚨 *Network Scanning Detected*"; break;
+        case '4': manualAlert = "🚨 *Auth Flood Detected*"; break;
+        case '5': manualAlert = "🚨 *Possible Password Cracking*"; break;
+        case '6': manualAlert = "🚨 *High ARP/Broadcast Traffic (Scanning)*"; break; // محاكاة يدوية للجديد
+      }
+      if (manualAlert.length() > 0) {
+        sendTelegramAlert(manualAlert);
+        lastAlertTime = millis();
+      }
+    }
+  }
+
+  // Reporting Interval
+  delay(REPORT_INTERVAL);
+
+
+  Serial.printf("[Mgmt] %lu | Probe %lu | Deauth %lu | Beacon %lu | Auth %lu | EAPOL %lu | Bcast(ARP) %lu\n",
+                mgmtCount, probeReqCount, deauthCount, beaconCount, authCount, eapolCount, broadcastCount);
+
+  String alertMsg = "";
+  unsigned long now = millis();
+
+  if (now - lastAlertTime > ALERT_COOLDOWN) {
+    if (deauthCount > 40) alertMsg = "🚨 *Deauth Attack Detected*";
+    else if (beaconCount > 400) alertMsg = "🚨 *Beacon Flood Detected*";
+    else if (probeReqCount > 50) alertMsg = "🚨 *Wi-Fi Scouting Detected (Probe Flood)*";
+    else if (authCount > 40) alertMsg = "🚨 *Auth Flood Detected*";
+    else if (eapolCount > 40) alertMsg = "🚨 *Possible Handshake Capture Detected*";
+    else if (broadcastCount > 100) alertMsg = "🚨 *Internal Network Mapping (ARP Flood)*"; 
+
+    if (alertMsg.length() > 0) {
+      sendTelegramAlert(alertMsg);
+      lastAlertTime = millis();
+    }
+  }
+
+  // Reset Counters
+  mgmtCount = beaconCount = probeReqCount = authCount = deauthCount = 0;
+  dataCount = eapolCount = broadcastCount = 0; 
+}

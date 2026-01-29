@@ -1,0 +1,156 @@
+/*
+ * ======================================================================================
+ * PROJECT NAME:   ESP32 DHCP Asset Discovery & Monitor
+ * AUTHOR:         [YAZAN TAHA] 
+ * DESCRIPTION:    Passive Network Monitor. Listens on UDP Port 67 (DHCP) to detect
+ * new devices joining the network (DORA process). Extracts MAC, IP, 
+ * and Hostname, then alerts via Telegram.
+ * ======================================================================================
+ */
+
+#include <WiFi.h>
+#include <AsyncUDP.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+
+// ============================
+// ⚠️ WiFi & Telegram Settings
+// ============================
+// NOTE: Sensitive credentials have been redacted for security purposes.
+const char* ssid = "YOUR_WIFI_SSID";          // Replace with Target Network Name
+const char* password = "YOUR_WIFI_PASSWORD";  // Replace with Target Network Password
+
+// Telegram API Configuration
+// Token format: 123456789:AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQq
+char TelegramBOTtoken[60] = "XXXXXXXXX:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"; 
+char Chat_ID[20] = "XXXXXXXXX"; // User ID
+
+// ============================
+// Objects Initialization
+// ============================
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(TelegramBOTtoken, secured_client);
+
+AsyncUDP udp; // AsyncUDP instance for listening to port 67
+
+// ============================
+// Global Flags & Buffers
+// ============================
+// Volatile used because these variables are shared between ISR/Callback and Main Loop
+volatile bool packetReady = false;
+volatile int packetLen = 0;
+
+uint8_t packetBuffer[600];   // Buffer to store raw packet data
+String finalMAC, finalIP, finalName;
+
+// ============================
+// UDP Packet Handler (Callback)
+// ============================
+// This function runs automatically when a UDP packet is received.
+// It is kept minimal to avoid blocking the network stack.
+void IRAM_ATTR udpHandler(AsyncUDPPacket packet) {
+  int len = packet.length();
+  if (len > sizeof(packetBuffer)) return; // Prevent buffer overflow
+
+  // Copy data to global buffer for processing in the main loop
+  memcpy(packetBuffer, packet.data(), len);
+  packetLen = len;
+  packetReady = true;      // Set flag only - Parsing is deferred to the main loop
+}
+
+// ============================
+// DHCP Parsing Logic
+// ============================
+// Extracts MAC, Hostname (Option 12), and Requested IP (Option 50)
+void parseDHCP() {
+  finalMAC = "";
+  finalIP  = "";
+  finalName = "";
+
+  // 1. Extract Hardware Address (MAC)
+  // DHCP packet structure: CHADDR starts at offset 28
+  int macLen = packetBuffer[2]; // Hardware address length (usually 6 for Ethernet)
+  int macStart = 28;
+
+  for (int i = 0; i < macLen; i++) {
+    if (i) finalMAC += ":";
+    finalMAC += String(packetBuffer[macStart+i], HEX);
+  }
+
+  // 2. Parse DHCP Options
+  // Options start at index 240 
+  int idx = 240;
+  while(idx < packetLen){
+    uint8_t opt = packetBuffer[idx]; // Option Code
+
+    if(opt == 0x0C){ // Option 12: Hostname
+      int len = packetBuffer[idx+1];
+      for(int i=0;i<len;i++)
+        finalName += char(packetBuffer[idx+2+i]);
+    }
+
+    if(opt == 0x32){ // Option 50 (0x32): Requested IP Address
+      for(int i=0;i<4;i++){
+        finalIP += String(packetBuffer[idx+2+i]);
+        if(i<3) finalIP += ".";
+      }
+    }
+
+    if(opt == 0xFF) break; // Option 255: End of Options
+    
+    // Move to next option: Current Index + Length Byte + Data Length
+    idx += packetBuffer[idx+1] + 2;
+  }
+}
+
+// ============================
+// System Setup
+// ============================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // 1. Connect to WiFi Station
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid,password);
+
+  while(WiFi.status() != WL_CONNECTED){
+    delay(200);
+    Serial.print(".");
+  }
+
+  // 2. Initialize Telegram & Send Boot Message
+  secured_client.setInsecure(); // Bypass SSL certificate check for ESP32
+  bot.sendMessage(Chat_ID,"📡 DHCP Monitor Started","");
+
+  // 3. Start UDP Listener on Port 67 (DHCP Server Port)
+  if(udp.listen(67)){
+    Serial.println("\nListening DHCP 67...");
+    udp.onPacket(udpHandler); // Attach callback function
+  }
+}
+
+// ============================
+// Main Loop
+// ============================
+void loop() {
+
+  // Check if a packet was captured by the ISR
+  if(packetReady){
+    packetReady = false; // Reset flag
+
+    // Perform heavy parsing logic here (outside the callback)
+    parseDHCP();
+
+    // If parsing was successful, format and send alert
+    if(finalMAC.length()>0){
+       String msg = "🚨 *New Device Joined*\n";
+       msg += "MAC: " + finalMAC + "\n";
+       msg += "IP: " + finalIP + "\n";
+       msg += "Host: " + finalName;
+
+       bot.sendMessage(Chat_ID, msg, "Markdown");
+    }
+  }
+
+}
